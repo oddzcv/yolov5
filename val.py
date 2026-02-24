@@ -2,16 +2,22 @@
 """
 Validate a trained YOLOv5 detection model on a detection dataset.
 
-Usage:
-    $ python val.py --weights yolov5s.pt --data coco128.yaml --img 640
+Revisions in this file:
+- Save per-image visualizations:
+    --save-per-image             (1 jpg per image, based on inference tensor 'im' at imgsz)
+    --save-per-image-native      (1 jpg per image, drawn on ORIGINAL image resolution like detect.py)
+    --save-per-image-limit       limit number of images saved (default=-1 means all)
 
-This revised version adds:
-    --save-per-image         Save 1 visualization JPG per image (pred + labels)
-    --save-per-image-limit   Limit number of images saved (default -1 = all)
+Native (original-resolution) visualization options:
+    --per-image-conf-label       show confidence on native images
+    --per-image-conf-decimals    decimals for confidence text
+    --per-image-line-thickness   bbox thickness in pixels
 
-Outputs (when --save-per-image is used):
-    runs/val/exp*/per_image/pred/<image_stem>.jpg
-    runs/val/exp*/per_image/labels/<image_stem>.jpg
+Outputs:
+    runs/val/exp*/per_image/pred/<stem>.jpg
+    runs/val/exp*/per_image/labels/<stem>.jpg
+    runs/val/exp*/per_image_native/pred/<stem>.jpg
+    runs/val/exp*/per_image_native/labels/<stem>.jpg
 """
 
 import argparse
@@ -54,6 +60,10 @@ from utils.general import (
 from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
+
+# For native/original-resolution drawing
+import cv2
+from ultralytics.utils.plotting import Annotator, colors as ucolors
 
 
 def save_one_txt(predn, save_conf, shape, file):
@@ -99,6 +109,61 @@ def process_batch(detections, labels, iouv):
     return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
 
 
+def _safe_imread(path: Path):
+    """Read image with OpenCV robustly (BGR). Returns None if failed."""
+    im = cv2.imread(str(path))
+    return im
+
+
+def _draw_native_pred(
+    im0_bgr: np.ndarray,
+    pred: torch.Tensor,
+    names: dict,
+    conf_thres: float,
+    line_thickness: int = 3,
+    show_conf: bool = True,
+    conf_decimals: int = 2,
+):
+    """
+    Draw predictions on original image (BGR) using Annotator, like detect.py.
+    'pred' expected in original image space (xyxy), with columns [x1,y1,x2,y2,conf,cls].
+    """
+    annotator = Annotator(im0_bgr, line_width=line_thickness, pil=False, example=str(names))
+    if pred is not None and len(pred):
+        for *xyxy, conf, cls in pred.tolist():
+            conf = float(conf)
+            if conf < conf_thres:
+                continue
+            c = int(cls)
+            name = names[c] if isinstance(names, dict) else str(c)
+            if show_conf:
+                label = f"{name} {conf:.{conf_decimals}f}"
+            else:
+                label = f"{name}"
+            annotator.box_label(xyxy, label, color=ucolors(c, True))
+    return annotator.result()
+
+
+def _draw_native_labels(
+    im0_bgr: np.ndarray,
+    labels_xyxy: torch.Tensor,
+    names: dict,
+    line_thickness: int = 3,
+):
+    """
+    Draw ground-truth labels on original image (BGR).
+    labels_xyxy: tensor Nx5 with [cls, x1,y1,x2,y2] in original image space.
+    """
+    annotator = Annotator(im0_bgr, line_width=line_thickness, pil=False, example=str(names))
+    if labels_xyxy is not None and len(labels_xyxy):
+        for row in labels_xyxy.tolist():
+            cls = int(row[0])
+            x1, y1, x2, y2 = row[1:]
+            name = names[cls] if isinstance(names, dict) else str(cls)
+            annotator.box_label([x1, y1, x2, y2], f"{name}", color=ucolors(cls, True))
+    return annotator.result()
+
+
 @smart_inference_mode()
 def run(
     data,
@@ -129,9 +194,16 @@ def run(
     plots=True,
     callbacks=Callbacks(),
     compute_loss=None,
-    # NEW:
+    # per-image (imgsz) visual
     save_per_image=False,
+    # per-image (native/original-res) visual
+    save_per_image_native=False,
+    # shared
     save_per_image_limit=-1,
+    # native label options
+    per_image_conf_label=False,
+    per_image_conf_decimals=2,
+    per_image_line_thickness=3,
 ):
     """Evaluates a YOLOv5 model on a dataset and logs performance metrics."""
     training = model is not None
@@ -146,12 +218,19 @@ def run(
         save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)
         (save_dir / "labels" if save_txt else save_dir).mkdir(parents=True, exist_ok=True)
 
-        # NEW: per-image visualization folders
+        # per-image folders (imgsz)
         per_img_pred_dir = save_dir / "per_image" / "pred"
         per_img_lbl_dir = save_dir / "per_image" / "labels"
         if save_per_image:
             per_img_pred_dir.mkdir(parents=True, exist_ok=True)
             per_img_lbl_dir.mkdir(parents=True, exist_ok=True)
+
+        # per-image folders (native/original)
+        per_img_native_pred_dir = save_dir / "per_image_native" / "pred"
+        per_img_native_lbl_dir = save_dir / "per_image_native" / "labels"
+        if save_per_image_native:
+            per_img_native_pred_dir.mkdir(parents=True, exist_ok=True)
+            per_img_native_lbl_dir.mkdir(parents=True, exist_ok=True)
 
         # Load model
         model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
@@ -214,7 +293,7 @@ def run(
     callbacks.run("on_val_start")
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)
 
-    # NEW: counter for how many images already saved (per-image mode)
+    # per-image save counter
     per_image_saved = 0
 
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
@@ -243,74 +322,152 @@ def run(
                 preds, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls, max_det=max_det
             )
 
-        # Metrics
+        # Metrics + per-image outputs
         for si, pred in enumerate(preds):
             labels = targets[targets[:, 0] == si, 1:]
             nl, npr = labels.shape[0], pred.shape[0]
-            path, shape = Path(paths[si]), shapes[si][0]
+            path = Path(paths[si])
+            shape0 = shapes[si][0]      # original image shape (h,w)
+            ratio_pad = shapes[si][1]   # letterbox ratio/pad used
+
             correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)
             seen += 1
 
+            # Prepare native (original-res) label boxes if needed
+            # labels format at this point: [cls, x, y, w, h] in pixels of the *inference image* (imgsz space)
+            native_label_xyxy = None
+            if save_per_image_native and nl:
+                tbox = xywh2xyxy(labels[:, 1:5])  # in inference space (imgsz)
+                # scale to original
+                tbox_native = tbox.clone()
+                scale_boxes(im[si].shape[1:], tbox_native, shape0, ratio_pad)
+                native_label_xyxy = torch.cat((labels[:, 0:1], tbox_native), 1)  # [cls,x1,y1,x2,y2]
+
             if npr == 0:
+                # stats for metric calc
                 if nl:
                     stats.append((correct, *torch.zeros((2, 0), device=device), labels[:, 0]))
                     if plots:
                         confusion_matrix.process_batch(detections=None, labels=labels[:, 0])
-                # Even if no predictions, we still may want to save label-only image in per-image mode
-                if plots and save_per_image:
+
+                # Optional per-image saving even if no preds
+                if plots and (save_per_image or save_per_image_native):
                     if save_per_image_limit < 0 or per_image_saved < save_per_image_limit:
-                        im1 = im[si:si + 1]
-                        t1 = targets[targets[:, 0] == si].clone()
-                        if len(t1):
-                            t1[:, 0] = 0
-                        plot_images(im1, t1, [str(path)], per_img_lbl_dir / f"{path.stem}.jpg", names)
-                        # pred image (no detections) – still saved for parity
-                        plot_images(im1, output_to_target([pred]), [str(path)], per_img_pred_dir / f"{path.stem}.jpg", names)
+                        # (A) imgsz-based per-image
+                        if save_per_image:
+                            im1 = im[si:si + 1]
+                            t1 = targets[targets[:, 0] == si].clone()
+                            if len(t1):
+                                t1[:, 0] = 0
+                            plot_images(im1, t1, [str(path)], per_img_lbl_dir / f"{path.stem}.jpg", names)
+                            plot_images(im1, output_to_target([pred]), [str(path)], per_img_pred_dir / f"{path.stem}.jpg", names)
+
+                        # (B) native per-image
+                        if save_per_image_native:
+                            im0 = _safe_imread(path)
+                            if im0 is not None:
+                                # draw GT
+                                if native_label_xyxy is None:
+                                    native_label_xyxy = torch.empty((0, 5))
+                                im_lbl = _draw_native_labels(
+                                    im0.copy(),
+                                    native_label_xyxy,
+                                    names,
+                                    line_thickness=per_image_line_thickness,
+                                )
+                                cv2.imwrite(str(per_img_native_lbl_dir / f"{path.stem}.jpg"), im_lbl)
+
+                                # draw preds (none)
+                                im_pred = _draw_native_pred(
+                                    im0.copy(),
+                                    pred=None,
+                                    names=names,
+                                    conf_thres=conf_thres,
+                                    line_thickness=per_image_line_thickness,
+                                    show_conf=per_image_conf_label,
+                                    conf_decimals=per_image_conf_decimals,
+                                )
+                                cv2.imwrite(str(per_img_native_pred_dir / f"{path.stem}.jpg"), im_pred)
+                            else:
+                                LOGGER.warning(f"Could not read image for native plot: {path}")
+
                         per_image_saved += 1
                 continue
 
             # Predictions
             if single_cls:
                 pred[:, 5] = 0
-            predn = pred.clone()
-            scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])
+
+            predn = pred.clone()  # native-space for metrics
+            scale_boxes(im[si].shape[1:], predn[:, :4], shape0, ratio_pad)
 
             # Evaluate
             if nl:
                 tbox = xywh2xyxy(labels[:, 1:5])
-                scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])
-                labelsn = torch.cat((labels[:, 0:1], tbox), 1)
+                tbox_native = tbox.clone()
+                scale_boxes(im[si].shape[1:], tbox_native, shape0, ratio_pad)
+                labelsn = torch.cat((labels[:, 0:1], tbox_native), 1)
                 correct = process_batch(predn, labelsn, iouv)
                 if plots:
                     confusion_matrix.process_batch(predn, labelsn)
 
             stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))
 
-            # Save/log
+            # Save txt/json
             if save_txt:
                 (save_dir / "labels").mkdir(parents=True, exist_ok=True)
-                save_one_txt(predn, save_conf, shape, file=save_dir / "labels" / f"{path.stem}.txt")
+                save_one_txt(predn, save_conf, shape0, file=save_dir / "labels" / f"{path.stem}.txt")
             if save_json:
                 save_one_json(predn, jdict, path, class_map)
+
             callbacks.run("on_val_image_end", pred, predn, path, names, im[si])
 
-            # NEW: Save per-image visualization (1 JPG per image)
-            if plots and save_per_image:
+            # ---- Per-image visualization saving ----
+            if plots and (save_per_image or save_per_image_native):
                 if save_per_image_limit < 0 or per_image_saved < save_per_image_limit:
-                    im1 = im[si:si + 1]
-                    t1 = targets[targets[:, 0] == si].clone()
-                    if len(t1):
-                        t1[:, 0] = 0  # reset index for single-image batch
+                    # (A) imgsz-based (like original val plot_images but 1 image only)
+                    if save_per_image:
+                        im1 = im[si:si + 1]
+                        t1 = targets[targets[:, 0] == si].clone()
+                        if len(t1):
+                            t1[:, 0] = 0
+                        plot_images(im1, t1, [str(path)], per_img_lbl_dir / f"{path.stem}.jpg", names)
+                        plot_images(im1, output_to_target([pred]), [str(path)], per_img_pred_dir / f"{path.stem}.jpg", names)
 
-                    # Save GT overlay
-                    plot_images(im1, t1, [str(path)], per_img_lbl_dir / f"{path.stem}.jpg", names)
-                    # Save prediction overlay
-                    plot_images(im1, output_to_target([pred]), [str(path)], per_img_pred_dir / f"{path.stem}.jpg", names)
+                    # (B) native/original-resolution (sharp like detect.py)
+                    if save_per_image_native:
+                        im0 = _safe_imread(path)
+                        if im0 is not None:
+                            # Ground truth native
+                            if native_label_xyxy is None:
+                                # compute if not prepared (e.g., nl==0)
+                                native_label_xyxy = torch.empty((0, 5))
+                            im_lbl = _draw_native_labels(
+                                im0.copy(),
+                                native_label_xyxy,
+                                names,
+                                line_thickness=per_image_line_thickness,
+                            )
+                            cv2.imwrite(str(per_img_native_lbl_dir / f"{path.stem}.jpg"), im_lbl)
+
+                            # Predictions native: use predn which is already scaled to original
+                            im_pred = _draw_native_pred(
+                                im0.copy(),
+                                predn,
+                                names=names,
+                                conf_thres=conf_thres,
+                                line_thickness=per_image_line_thickness,
+                                show_conf=per_image_conf_label,
+                                conf_decimals=per_image_conf_decimals,
+                            )
+                            cv2.imwrite(str(per_img_native_pred_dir / f"{path.stem}.jpg"), im_pred)
+                        else:
+                            LOGGER.warning(f"Could not read image for native plot: {path}")
 
                     per_image_saved += 1
 
-        # Batch grid plots (keep original behavior ONLY if not using per-image)
-        if plots and (not save_per_image) and batch_i < 3:
+        # Keep original batch grid plots only when NOT using per-image saving (avoid huge duplicates)
+        if plots and (not save_per_image) and (not save_per_image_native) and batch_i < 3:
             plot_images(im, targets, paths, save_dir / f"val_batch{batch_i}_labels.jpg", names)
             plot_images(im, output_to_target(preds), paths, save_dir / f"val_batch{batch_i}_pred.jpg", names)
 
@@ -380,7 +537,9 @@ def run(
         s2 = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ""
         extra = ""
         if save_per_image:
-            extra = f"\nPer-image visualizations saved to {save_dir / 'per_image'} (pred/labels)"
+            extra += f"\nPer-image (imgsz) visualizations saved to {save_dir / 'per_image'} (pred/labels)"
+        if save_per_image_native:
+            extra += f"\nPer-image (native) visualizations saved to {save_dir / 'per_image_native'} (pred/labels)"
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s2}{extra}")
 
     maps = np.zeros(nc) + map
@@ -415,18 +574,24 @@ def parse_opt():
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
 
-    # NEW:
-    parser.add_argument(
-        "--save-per-image",
-        action="store_true",
-        help="save per-image visualization (1 jpg per image) for predictions and labels",
-    )
-    parser.add_argument(
-        "--save-per-image-limit",
-        type=int,
-        default=-1,
-        help="limit number of images saved (default=-1 means all)",
-    )
+    # per-image saving (imgsz)
+    parser.add_argument("--save-per-image", action="store_true",
+                        help="save per-image visualization (1 jpg per image) based on inference tensor 'im' at imgsz")
+
+    # per-image saving (native/original)
+    parser.add_argument("--save-per-image-native", action="store_true",
+                        help="save per-image visualization (1 jpg per image) drawn on ORIGINAL image resolution")
+
+    parser.add_argument("--save-per-image-limit", type=int, default=-1,
+                        help="limit number of images saved (default=-1 means all)")
+
+    # native label options
+    parser.add_argument("--per-image-conf-label", action="store_true",
+                        help="(native) show confidence score on bbox label")
+    parser.add_argument("--per-image-conf-decimals", type=int, default=2,
+                        help="(native) number of decimals for confidence label")
+    parser.add_argument("--per-image-line-thickness", type=int, default=3,
+                        help="(native) bbox line thickness in pixels")
 
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)
